@@ -19,8 +19,8 @@ DEFAULT_VOICE_MODE = os.getenv('VOICE_MODE', 'normal').strip().lower()
 
 VOICE_FILTERS = {
     'normal': '-vn',
-    'thin': '-vn -af "asetrate=44100*0.82,aresample=44100,atempo=1.08,afftfilt=real=re*0.75:imag=im*1.8,aecho=0.8:0.9:35:0.25,aecho=0.6:0.6:80:0.18"',
-    'decepticon': '-vn -af "asetrate=44100*1.28,aresample=44100,atempo=0.75,afftfilt=real=re*1.35:imag=im*0.55,aecho=0.9:0.9:95:0.35,aecho=0.7:0.6:170:0.22"',
+    'thin': '-vn -af "asetrate=44100*1.18,aresample=44100,atempo=0.95"',
+    'decepticon': '-vn -af "asetrate=44100*0.62,aresample=44100,atempo=0.75"',
 }
 
 VOICE_LABELS = {
