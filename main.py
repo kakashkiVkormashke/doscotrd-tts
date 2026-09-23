@@ -19,7 +19,14 @@ DEFAULT_VOICE_MODE = os.getenv('VOICE_MODE', 'normal').strip().lower()
 
 VOICE_FILTERS = {
     'normal': '-vn',
-    'decepticon': '-vn -af "asetrate=44100*0.82,aresample=44100,atempo=1.08,afftfilt=real=re*0.75:imag=im*1.8,aecho=0.8:0.9:35:0.25,aecho=0.6:0.6:80:0.18"',
+    'thin': '-vn -af "asetrate=44100*0.82,aresample=44100,atempo=1.08,afftfilt=real=re*0.75:imag=im*1.8,aecho=0.8:0.9:35:0.25,aecho=0.6:0.6:80:0.18"',
+    'decepticon': '-vn -af "asetrate=44100*1.28,aresample=44100,atempo=0.75,afftfilt=real=re*1.35:imag=im*0.55,aecho=0.9:0.9:95:0.35,aecho=0.7:0.6:170:0.22"',
+}
+
+VOICE_LABELS = {
+    'normal': 'обычный',
+    'thin': 'тонкий',
+    'decepticon': 'десептикон',
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -62,6 +69,8 @@ class TTSBot(discord.Client):
         normalized = ' '.join(text.lower().replace('ё', 'е').split()).rstrip('!.?')
         if normalized in {'десептикон', 'голос десептикона', 'режим десептикон', 'робот', 'робо голос'}:
             return 'decepticon'
+        if normalized in {'тонкий голос', 'тонкий', 'высокий голос', 'режим тонкий'}:
+            return 'thin'
         if normalized in {'обычный голос', 'нормальный голос', 'обычный', 'режим обычный'}:
             return 'normal'
         if normalized in {'голос', 'какой голос', 'режим голоса'}:
@@ -79,17 +88,12 @@ class TTSBot(discord.Client):
             return
 
         control = self.parse_control(text)
-        if control == 'decepticon':
-            self.voice_mode = 'decepticon'
-            await self.say(message.channel, 'Голос десептикона включён.')
-            return
-        if control == 'normal':
-            self.voice_mode = 'normal'
-            await self.say(message.channel, 'Обычный голос включён.')
+        if control in {'decepticon', 'thin', 'normal'}:
+            self.voice_mode = control
+            await self.say(message.channel, f'Голос включён: {VOICE_LABELS[control]}.')
             return
         if control == 'status':
-            label = 'десептикон' if self.voice_mode == 'decepticon' else 'обычный'
-            await self.say(message.channel, f'Сейчас голос: {label}.')
+            await self.say(message.channel, f'Сейчас голос: {VOICE_LABELS[self.voice_mode]}.')
             return
 
         if not getattr(message.author, 'voice', None) or not message.author.voice.channel:
