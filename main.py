@@ -15,6 +15,12 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
 TTS_CHANNEL_ID = int(os.getenv('TTS_CHANNEL_ID', '1428896474611187734'))
 MAX_TEXT_LENGTH = int(os.getenv('MAX_TEXT_LENGTH', '450'))
+DEFAULT_VOICE_MODE = os.getenv('VOICE_MODE', 'normal').strip().lower()
+
+VOICE_FILTERS = {
+    'normal': '-vn',
+    'decepticon': '-vn -af "asetrate=44100*0.82,aresample=44100,atempo=1.08,afftfilt=real=re*0.75:imag=im*1.8,aecho=0.8:0.9:35:0.25,aecho=0.6:0.6:80:0.18"',
+}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log = logging.getLogger('tts')
@@ -30,12 +36,13 @@ class TTSBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.queue = asyncio.Queue(maxsize=50)
         self.worker = None
+        self.voice_mode = DEFAULT_VOICE_MODE if DEFAULT_VOICE_MODE in VOICE_FILTERS else 'normal'
 
     async def setup_hook(self):
         self.worker = asyncio.create_task(self.player())
 
     async def on_ready(self):
-        log.info('Connected as %s; TTS channel=%s', self.user, TTS_CHANNEL_ID)
+        log.info('Connected as %s; TTS channel=%s; voice_mode=%s', self.user, TTS_CHANNEL_ID, self.voice_mode)
 
     async def safe_delete(self, message):
         try:
@@ -51,6 +58,16 @@ class TTSBot(discord.Client):
         except discord.HTTPException:
             log.warning('Could not send status message')
 
+    def parse_control(self, text):
+        normalized = ' '.join(text.lower().replace('ё', 'е').split()).rstrip('!.?')
+        if normalized in {'десептикон', 'голос десептикона', 'режим десептикон', 'робот', 'робо голос'}:
+            return 'decepticon'
+        if normalized in {'обычный голос', 'нормальный голос', 'обычный', 'режим обычный'}:
+            return 'normal'
+        if normalized in {'голос', 'какой голос', 'режим голоса'}:
+            return 'status'
+        return None
+
     async def on_message(self, message):
         if message.author.bot or not message.guild or message.channel.id != TTS_CHANNEL_ID:
             return
@@ -60,6 +77,21 @@ class TTSBot(discord.Client):
 
         if not text:
             return
+
+        control = self.parse_control(text)
+        if control == 'decepticon':
+            self.voice_mode = 'decepticon'
+            await self.say(message.channel, 'Голос десептикона включён.')
+            return
+        if control == 'normal':
+            self.voice_mode = 'normal'
+            await self.say(message.channel, 'Обычный голос включён.')
+            return
+        if control == 'status':
+            label = 'десептикон' if self.voice_mode == 'decepticon' else 'обычный'
+            await self.say(message.channel, f'Сейчас голос: {label}.')
+            return
+
         if not getattr(message.author, 'voice', None) or not message.author.voice.channel:
             await self.say(message.channel, 'Зайди в голосовой канал, потом напиши текст для озвучки.')
             return
@@ -70,7 +102,7 @@ class TTSBot(discord.Client):
             await self.say(message.channel, 'Очередь озвучки заполнена, попробуй чуть позже.')
             return
 
-        self.queue.put_nowait((message.channel, message.author.voice.channel, text))
+        self.queue.put_nowait((message.channel, message.author.voice.channel, text, self.voice_mode))
 
     async def make_tts_file(self, text):
         path = Path(tempfile.gettempdir()) / f'discord_tts_{uuid.uuid4().hex}.mp3'
@@ -89,14 +121,14 @@ class TTSBot(discord.Client):
             await voice_client.move_to(voice_channel)
         return voice_client
 
-    async def play_file(self, voice_client, path):
+    async def play_file(self, voice_client, path, voice_mode):
         loop = asyncio.get_running_loop()
         done = loop.create_future()
 
         def finish(error):
             loop.call_soon_threadsafe(done.set_result, error)
 
-        source = discord.FFmpegPCMAudio(str(path), options='-vn')
+        source = discord.FFmpegPCMAudio(str(path), options=VOICE_FILTERS.get(voice_mode, VOICE_FILTERS['normal']))
         voice_client.play(source, after=finish)
         error = await done
         source.cleanup()
@@ -105,15 +137,13 @@ class TTSBot(discord.Client):
 
     async def player(self):
         while True:
-            text_channel, voice_channel, text = await self.queue.get()
+            text_channel, voice_channel, text, voice_mode = await self.queue.get()
             path = None
             try:
                 path = await self.make_tts_file(text)
                 voice_client = await self.get_voice_client(text_channel, voice_channel)
-                await self.play_file(voice_client, path)
-                log.info('Spoken text from #%s: %s', text_channel.id, text)
-                if self.queue.empty() and voice_client.is_connected():
-                    await voice_client.disconnect()
+                await self.play_file(voice_client, path, voice_mode)
+                log.info('Spoken text from #%s with %s voice: %s', text_channel.id, voice_mode, text)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
