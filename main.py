@@ -1,65 +1,145 @@
-import discord
-import os
 import asyncio
-from gtts import gTTS
+import logging
+import os
+import shutil
+import tempfile
 import uuid
+from pathlib import Path
 
-TOKEN = os.environ.get('DISCORD_TOKEN')
-TTS_CHANNEL_ID = int(os.environ.get('TTS_CHANNEL_ID', 1428896474611187734))
+import discord
+from dotenv import load_dotenv
+from gtts import gTTS
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
+load_dotenv()
 
-bot = discord.Client(intents=intents)
+TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
+TTS_CHANNEL_ID = int(os.getenv('TTS_CHANNEL_ID', '1428896474611187734'))
+MAX_TEXT_LENGTH = int(os.getenv('MAX_TEXT_LENGTH', '450'))
 
-@bot.event
-async def on_ready():
-    print(f'✅ Бот {bot.user} запущен!')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+log = logging.getLogger('tts')
 
-@bot.event
-async def on_message(message):
-    if message.author.bot or message.channel.id != TTS_CHANNEL_ID:
-        return
-    
-    if message.author.voice is None:
-        await message.delete()
-        return
 
-    text = message.content.strip()
-    await message.delete()
-    
-    if not text:
-        return
+class TTSBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.guild_messages = True
+        intents.voice_states = True
+        intents.message_content = True
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+        self.queue = asyncio.Queue(maxsize=50)
+        self.worker = None
 
-    try:
-        filename = f'tts_{uuid.uuid4()}.mp3'
-        tts = gTTS(text=text, lang='ru', slow=False)
-        tts.save(filename)
-        
-        voice_channel = message.author.voice.channel
-        voice_client = message.guild.voice_client
-        
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
+    async def setup_hook(self):
+        self.worker = asyncio.create_task(self.player())
+
+    async def on_ready(self):
+        log.info('Connected as %s; TTS channel=%s', self.user, TTS_CHANNEL_ID)
+
+    async def safe_delete(self, message):
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            log.warning('Missing Manage Messages permission in channel %s', message.channel.id)
+        except discord.HTTPException:
+            log.warning('Could not delete message %s', message.id)
+
+    async def say(self, channel, text):
+        try:
+            await channel.send(text[:1900])
+        except discord.HTTPException:
+            log.warning('Could not send status message')
+
+    async def on_message(self, message):
+        if message.author.bot or not message.guild or message.channel.id != TTS_CHANNEL_ID:
+            return
+
+        text = ' '.join(message.content.split())
+        await self.safe_delete(message)
+
+        if not text:
+            return
+        if not getattr(message.author, 'voice', None) or not message.author.voice.channel:
+            await self.say(message.channel, 'Зайди в голосовой канал, потом напиши текст для озвучки.')
+            return
+        if len(text) > MAX_TEXT_LENGTH:
+            await self.say(message.channel, f'Слишком длинный текст. Лимит: {MAX_TEXT_LENGTH} символов.')
+            return
+        if self.queue.full():
+            await self.say(message.channel, 'Очередь озвучки заполнена, попробуй чуть позже.')
+            return
+
+        self.queue.put_nowait((message.channel, message.author.voice.channel, text))
+
+    async def make_tts_file(self, text):
+        path = Path(tempfile.gettempdir()) / f'discord_tts_{uuid.uuid4().hex}.mp3'
+
+        def save():
+            gTTS(text=text, lang='ru', slow=False).save(str(path))
+
+        await asyncio.to_thread(save)
+        return path
+
+    async def get_voice_client(self, text_channel, voice_channel):
+        voice_client = text_channel.guild.voice_client
+        if voice_client is None or not voice_client.is_connected():
+            return await voice_channel.connect(timeout=30, self_deaf=True)
+        if voice_client.channel != voice_channel:
             await voice_client.move_to(voice_channel)
-        
-        audio_source = discord.FFmpegPCMAudio(filename)
-        
-        def cleanup(error):
-            if os.path.exists(filename):
-                os.remove(filename)
-            if voice_client.is_connected():
-                asyncio.create_task(voice_client.disconnect())
-        
-        voice_client.play(audio_source, after=cleanup)
-        print(f"🔊 Озвучено: {text}")
-        
-    except Exception as e:
-        print(f'❌ Ошибка: {e}')
-        if 'filename' in locals() and os.path.exists(filename):
-            os.remove(filename)
+        return voice_client
 
-if __name__ == "__main__":
-    bot.run(TOKEN)
+    async def play_file(self, voice_client, path):
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        def finish(error):
+            loop.call_soon_threadsafe(done.set_result, error)
+
+        source = discord.FFmpegPCMAudio(str(path), options='-vn')
+        voice_client.play(source, after=finish)
+        error = await done
+        source.cleanup()
+        if error:
+            raise error
+
+    async def player(self):
+        while True:
+            text_channel, voice_channel, text = await self.queue.get()
+            path = None
+            try:
+                path = await self.make_tts_file(text)
+                voice_client = await self.get_voice_client(text_channel, voice_channel)
+                await self.play_file(voice_client, path)
+                log.info('Spoken text from #%s: %s', text_channel.id, text)
+                if self.queue.empty() and voice_client.is_connected():
+                    await voice_client.disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log.warning('TTS failed: %s', error)
+                await self.say(text_channel, 'Не получилось озвучить сообщение. Проверь логи, FFmpeg и доступ к gTTS.')
+            finally:
+                if path and path.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        log.warning('Could not remove temp file %s', path)
+                self.queue.task_done()
+
+    async def close(self):
+        if self.worker:
+            self.worker.cancel()
+        for voice_client in self.voice_clients:
+            await voice_client.disconnect(force=True)
+        if self.worker:
+            await asyncio.gather(self.worker, return_exceptions=True)
+        await super().close()
+
+
+if __name__ == '__main__':
+    if not TOKEN:
+        raise SystemExit('Set DISCORD_TOKEN in environment or .env')
+    if not shutil.which('ffmpeg'):
+        raise SystemExit('Install ffmpeg and add it to PATH')
+    TTSBot().run(TOKEN)
